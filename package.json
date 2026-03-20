@@ -4,10 +4,21 @@
   "type": "module",
   "license": "MIT",
   "scripts": {
-    "dev": "NODE_ENV=development tsx server/index.ts",
+    "dev": "tsx server/index.ts",
+    "dev:web": "tsx server/index.ts",
+    "dev:scheduler": "tsx server/scheduler.ts",
     "build": "tsx script/build.ts",
-    "start": "NODE_ENV=production node dist/index.cjs",
+    "start": "node dist/index.cjs",
+    "start:web": "node dist/index.cjs",
+    "start:scheduler": "node dist/scheduler.cjs",
     "check": "tsc",
+    "test": "npm run test:all",
+    "test:all": "npm run test:guardrails && npm run test:auth && npm run test:scenario-lab && npm run test:weather",
+    "test:guardrails": "tsx tests/test_hybrid_guardrails.ts",
+    "test:auth": "tsx tests/test_auth_flows.ts",
+    "test:scenario-lab": "tsx tests/test_scenario_lab.ts",
+    "test:weather": "tsx tests/test_weather_service.ts",
+    "verify": "npm run check && npm run build && npm run test",
     "db:push": "drizzle-kit push"
   },
   "dependencies": {

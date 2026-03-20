@@ -1,186 +1,149 @@
 import { useQuery } from "@tanstack/react-query";
+import { Link } from "wouter";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
-import { Users, FileText, AlertTriangle, IndianRupee, TrendingUp, Shield, Thermometer, CloudRain, Wind, Ban, CloudLightning } from "lucide-react";
-import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, PieChart, Pie, Cell, LineChart, Line } from "recharts";
-import type { WeatherAlert, Claim } from "@shared/schema";
+import { Users, Shield, AlertTriangle, IndianRupee, TrendingUp, Thermometer, CloudRain, Wind } from "lucide-react";
+import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from "recharts";
+import type { Claim, DisruptionEvent } from "@shared/schema";
 
-const COLORS = ["hsl(160, 84%, 39%)", "hsl(200, 80%, 48%)", "hsl(43, 74%, 49%)", "hsl(0, 84%, 55%)", "hsl(280, 67%, 55%)", "hsl(30, 87%, 55%)"];
+interface DashboardStats {
+  totalWorkers: number;
+  activePolicies: number;
+  totalClaims: number;
+  totalPayouts: number;
+  totalPremiumCollected: number;
+  totalClaimsPaid: number;
+  lossRatio: number;
+  avgFraudScore: number;
+  claimsByType: Record<string, number>;
+  claimsByStatus: Record<string, number>;
+  weeklyTrend: { week: string; premiums: number; claims: number }[];
+}
+
+interface LiveWeatherResponse {
+  status: string;
+  fetchedAt: string;
+  cities: Array<{
+    city: string;
+    temperature: number;
+    rainfall: number;
+    aqi: number | null;
+    description: string;
+  }>;
+}
 
 const triggerIcons: Record<string, typeof Thermometer> = {
   extreme_heat: Thermometer,
   heavy_rain: CloudRain,
   flood: CloudRain,
   pollution: Wind,
-  curfew: Ban,
-  strike: Ban,
-};
-
-const triggerLabels: Record<string, string> = {
-  extreme_heat: "Extreme Heat",
-  heavy_rain: "Heavy Rain",
-  flood: "Flood",
-  pollution: "Pollution",
-  curfew: "Curfew",
-  strike: "Strike",
 };
 
 export default function Dashboard() {
-  const { data: stats, isLoading: statsLoading } = useQuery<{
-    totalWorkers: number;
-    activePolicies: number;
-    totalClaims: number;
-    totalPayouts: number;
-    totalPremiumCollected: number;
-    totalClaimsPaid: number;
-    lossRatio: number;
-    avgFraudScore: number;
-    claimsByType: Record<string, number>;
-    weeklyTrend: { week: string; premiums: number; claims: number }[];
-  }>({ queryKey: ["/api/dashboard"] });
-
-  const { data: alerts } = useQuery<WeatherAlert[]>({ queryKey: ["/api/alerts"] });
-  const { data: claims } = useQuery<Claim[]>({ queryKey: ["/api/claims"] });
-
-  const recentClaims = claims?.sort((a, b) => new Date(b.triggeredAt).getTime() - new Date(a.triggeredAt).getTime()).slice(0, 5);
-
-  const pieData = stats?.claimsByType
-    ? Object.entries(stats.claimsByType).map(([key, value]) => ({
-        name: triggerLabels[key] || key,
-        value,
-      }))
-    : [];
+  const { data: stats, isLoading: statsLoading } = useQuery<DashboardStats>({ queryKey: ["/api/dashboard"] });
+  const { data: claims } = useQuery<Claim[]>({ queryKey: ["/api/admin/claims"] });
+  const { data: events } = useQuery<DisruptionEvent[]>({ queryKey: ["/api/admin/events"] });
+  const { data: liveWeather, isLoading: weatherLoading } = useQuery<LiveWeatherResponse>({
+    queryKey: ["/api/weather/live"],
+    refetchInterval: 120000,
+  });
 
   if (statsLoading) {
     return (
       <div className="p-6 space-y-6">
         <div className="grid grid-cols-4 gap-4">
-          {[...Array(4)].map((_, i) => (
-            <Skeleton key={i} className="h-28 rounded-lg" />
+          {[...Array(4)].map((_, index) => (
+            <Skeleton key={index} className="h-28 rounded-lg" />
           ))}
         </div>
-        <div className="grid grid-cols-2 gap-4">
-          <Skeleton className="h-72 rounded-lg" />
-          <Skeleton className="h-72 rounded-lg" />
-        </div>
+        <Skeleton className="h-72 rounded-lg" />
       </div>
     );
   }
+
+  const recentClaims = claims?.slice(0, 5) || [];
 
   return (
     <div className="p-6 space-y-6">
       <div className="flex items-center justify-between">
         <div>
-          <h1 className="text-xl font-semibold text-foreground" data-testid="text-page-title">Admin Dashboard</h1>
-          <p className="text-sm text-muted-foreground mt-0.5">GigShield Parametric Insurance Platform</p>
+          <h1 className="text-xl font-semibold text-foreground">Hybrid Guardrails Dashboard</h1>
+          <p className="text-sm text-muted-foreground mt-0.5">Verified baselines, disruption events, and measurable impact now drive every payout decision.</p>
         </div>
-        {alerts && alerts.length > 0 && (
-          <Badge variant="destructive" className="animate-pulse" data-testid="badge-active-alerts">
-            <AlertTriangle className="w-3 h-3 mr-1" />
-            {alerts.length} Active Alert{alerts.length > 1 ? "s" : ""}
-          </Badge>
-        )}
+        <div className="flex items-center gap-2">
+          <Badge variant="outline">{events?.length || 0} disruption events</Badge>
+          <Link href="/simulate">
+            <Button size="sm" variant="outline">Open Scenario Lab</Button>
+          </Link>
+        </div>
       </div>
 
-      {/* KPI Cards */}
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
-        <Card data-testid="card-total-workers">
-          <CardContent className="p-4">
-            <div className="flex items-center gap-3">
-              <div className="p-2 rounded-lg bg-primary/10"><Users className="w-4 h-4 text-primary" /></div>
-              <div>
-                <p className="text-2xl font-bold text-foreground">{stats?.totalWorkers}</p>
-                <p className="text-xs text-muted-foreground">Registered Workers</p>
-              </div>
+        <Card>
+          <CardContent className="p-4 flex items-center gap-3">
+            <div className="p-2 rounded-lg bg-primary/10">
+              <Users className="w-4 h-4 text-primary" />
+            </div>
+            <div>
+              <p className="text-2xl font-bold">{stats?.totalWorkers}</p>
+              <p className="text-xs text-muted-foreground">Workers</p>
             </div>
           </CardContent>
         </Card>
-        <Card data-testid="card-active-policies">
-          <CardContent className="p-4">
-            <div className="flex items-center gap-3">
-              <div className="p-2 rounded-lg bg-blue-500/10"><Shield className="w-4 h-4 text-blue-500" /></div>
-              <div>
-                <p className="text-2xl font-bold text-foreground">{stats?.activePolicies}</p>
-                <p className="text-xs text-muted-foreground">Active Policies</p>
-              </div>
+        <Card>
+          <CardContent className="p-4 flex items-center gap-3">
+            <div className="p-2 rounded-lg bg-blue-500/10">
+              <Shield className="w-4 h-4 text-blue-500" />
+            </div>
+            <div>
+              <p className="text-2xl font-bold">{stats?.activePolicies}</p>
+              <p className="text-xs text-muted-foreground">Active Policies</p>
             </div>
           </CardContent>
         </Card>
-        <Card data-testid="card-total-claims">
-          <CardContent className="p-4">
-            <div className="flex items-center gap-3">
-              <div className="p-2 rounded-lg bg-amber-500/10"><AlertTriangle className="w-4 h-4 text-amber-500" /></div>
-              <div>
-                <p className="text-2xl font-bold text-foreground">{stats?.totalClaims}</p>
-                <p className="text-xs text-muted-foreground">Total Claims</p>
-              </div>
+        <Card>
+          <CardContent className="p-4 flex items-center gap-3">
+            <div className="p-2 rounded-lg bg-amber-500/10">
+              <AlertTriangle className="w-4 h-4 text-amber-500" />
+            </div>
+            <div>
+              <p className="text-2xl font-bold">{stats?.claimsByStatus?.manual_review || 0}</p>
+              <p className="text-xs text-muted-foreground">Manual Review</p>
             </div>
           </CardContent>
         </Card>
-        <Card data-testid="card-total-payouts">
-          <CardContent className="p-4">
-            <div className="flex items-center gap-3">
-              <div className="p-2 rounded-lg bg-green-500/10"><IndianRupee className="w-4 h-4 text-green-500" /></div>
-              <div>
-                <p className="text-2xl font-bold text-foreground">₹{stats?.totalClaimsPaid?.toLocaleString("en-IN")}</p>
-                <p className="text-xs text-muted-foreground">Total Paid Out</p>
-              </div>
+        <Card>
+          <CardContent className="p-4 flex items-center gap-3">
+            <div className="p-2 rounded-lg bg-green-500/10">
+              <IndianRupee className="w-4 h-4 text-green-500" />
+            </div>
+            <div>
+              <p className="text-2xl font-bold">₹{stats?.totalClaimsPaid.toLocaleString("en-IN")}</p>
+              <p className="text-xs text-muted-foreground">Paid Out</p>
             </div>
           </CardContent>
         </Card>
       </div>
 
-      {/* Financial KPIs */}
-      <div className="grid grid-cols-3 gap-4">
-        <Card>
-          <CardContent className="p-4">
-            <p className="text-xs text-muted-foreground">Premium Collected</p>
-            <p className="text-lg font-bold text-foreground mt-1">₹{stats?.totalPremiumCollected?.toLocaleString("en-IN")}</p>
-            <div className="flex items-center gap-1 mt-1">
-              <TrendingUp className="w-3 h-3 text-primary" />
-              <span className="text-xs text-primary">Weekly billing cycle</span>
-            </div>
-          </CardContent>
-        </Card>
-        <Card>
-          <CardContent className="p-4">
-            <p className="text-xs text-muted-foreground">Loss Ratio</p>
-            <p className="text-lg font-bold text-foreground mt-1">{((stats?.lossRatio || 0) * 100).toFixed(1)}%</p>
-            <div className="flex items-center gap-1 mt-1">
-              <span className="text-xs text-muted-foreground">Claims / Premiums</span>
-            </div>
-          </CardContent>
-        </Card>
-        <Card>
-          <CardContent className="p-4">
-            <p className="text-xs text-muted-foreground">Avg Fraud Score</p>
-            <p className="text-lg font-bold text-foreground mt-1">{stats?.avgFraudScore?.toFixed(1)}/100</p>
-            <div className="flex items-center gap-1 mt-1">
-              <span className="text-xs text-muted-foreground">AI-powered detection</span>
-            </div>
-          </CardContent>
-        </Card>
-      </div>
-
-      {/* Charts Row */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-        <Card>
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+        <Card className="lg:col-span-2">
           <CardHeader className="pb-2">
-            <CardTitle className="text-sm font-medium">Weekly Premiums vs Claims</CardTitle>
+            <CardTitle className="text-sm font-medium">Premiums vs Paid Claims</CardTitle>
           </CardHeader>
           <CardContent className="pt-0">
-            <ResponsiveContainer width="100%" height={240}>
+            <ResponsiveContainer width="100%" height={260}>
               <BarChart data={stats?.weeklyTrend}>
                 <CartesianGrid strokeDasharray="3 3" stroke="hsl(var(--border))" />
                 <XAxis dataKey="week" tick={{ fontSize: 11 }} stroke="hsl(var(--muted-foreground))" />
                 <YAxis tick={{ fontSize: 11 }} stroke="hsl(var(--muted-foreground))" />
                 <Tooltip
-                  contentStyle={{ background: "hsl(var(--card))", border: "1px solid hsl(var(--border))", borderRadius: 8, fontSize: 12 }}
+                  contentStyle={{ background: "hsl(var(--card))", border: "1px solid hsl(var(--border))", borderRadius: 8 }}
                   formatter={(value: number) => [`₹${value}`, ""]}
                 />
-                <Bar dataKey="premiums" fill="hsl(160, 84%, 39%)" radius={[4, 4, 0, 0]} name="Premiums" />
-                <Bar dataKey="claims" fill="hsl(200, 80%, 48%)" radius={[4, 4, 0, 0]} name="Claims Paid" />
+                <Bar dataKey="premiums" fill="hsl(160, 84%, 39%)" radius={[4, 4, 0, 0]} />
+                <Bar dataKey="claims" fill="hsl(200, 80%, 48%)" radius={[4, 4, 0, 0]} />
               </BarChart>
             </ResponsiveContainer>
           </CardContent>
@@ -188,47 +151,61 @@ export default function Dashboard() {
 
         <Card>
           <CardHeader className="pb-2">
-            <CardTitle className="text-sm font-medium">Claims by Disruption Type</CardTitle>
+            <CardTitle className="text-sm font-medium">Claim Outcomes</CardTitle>
           </CardHeader>
-          <CardContent className="pt-0">
-            <ResponsiveContainer width="100%" height={240}>
-              <PieChart>
-                <Pie data={pieData} cx="50%" cy="50%" innerRadius={55} outerRadius={85} paddingAngle={3} dataKey="value" label={({ name, value }) => `${name}: ${value}`} labelLine={false}>
-                  {pieData.map((_, index) => (
-                    <Cell key={index} fill={COLORS[index % COLORS.length]} />
-                  ))}
-                </Pie>
-                <Tooltip contentStyle={{ background: "hsl(var(--card))", border: "1px solid hsl(var(--border))", borderRadius: 8, fontSize: 12 }} />
-              </PieChart>
-            </ResponsiveContainer>
+          <CardContent className="space-y-2">
+            {Object.entries(stats?.claimsByStatus || {}).map(([status, count]) => (
+              <div key={status} className="flex items-center justify-between rounded-lg border border-border px-3 py-2">
+                <span className="text-sm capitalize">{status.replace(/_/g, " ")}</span>
+                <Badge variant="outline">{count}</Badge>
+              </div>
+            ))}
           </CardContent>
         </Card>
       </div>
 
-      {/* Active Alerts + Recent Claims */}
+      <Card>
+        <CardHeader className="pb-2">
+          <CardTitle className="text-sm font-medium">Live Weather</CardTitle>
+        </CardHeader>
+        <CardContent>
+          {weatherLoading ? (
+            <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-7 gap-2">
+              {[...Array(7)].map((_, index) => <Skeleton key={index} className="h-24 rounded-lg" />)}
+            </div>
+          ) : (
+            <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-7 gap-2">
+              {liveWeather?.cities?.map((city) => (
+                <div key={city.city} className="rounded-lg border border-border p-3 space-y-1">
+                  <p className="text-xs font-semibold">{city.city}</p>
+                  <p className="text-xs">{city.temperature}°C</p>
+                  <p className="text-xs">{city.rainfall}mm/hr</p>
+                  {city.aqi !== null && <p className="text-xs">AQI {city.aqi}</p>}
+                </div>
+              ))}
+            </div>
+          )}
+        </CardContent>
+      </Card>
+
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
         <Card>
           <CardHeader className="pb-2">
-            <CardTitle className="text-sm font-medium flex items-center gap-2">
-              <CloudLightning className="w-4 h-4" /> Active Weather Alerts
-            </CardTitle>
+            <CardTitle className="text-sm font-medium">Recent Disruption Events</CardTitle>
           </CardHeader>
-          <CardContent className="space-y-2 pt-0">
-            {alerts?.length === 0 && <p className="text-sm text-muted-foreground py-4 text-center">No active alerts</p>}
-            {alerts?.map((alert) => {
-              const Icon = triggerIcons[alert.alertType] || AlertTriangle;
+          <CardContent className="space-y-2">
+            {events?.slice(0, 5).map((event) => {
+              const Icon = triggerIcons[event.triggerType] || Thermometer;
               return (
-                <div key={alert.id} className="flex items-center justify-between p-2.5 rounded-lg bg-accent/50 border border-border" data-testid={`alert-${alert.id}`}>
-                  <div className="flex items-center gap-2.5">
-                    <Icon className="w-4 h-4 text-destructive" />
+                <div key={event.id} className="rounded-lg border border-border p-3 flex items-center justify-between">
+                  <div className="flex items-center gap-2">
+                    <Icon className="w-4 h-4 text-primary" />
                     <div>
-                      <p className="text-sm font-medium text-foreground">{triggerLabels[alert.alertType]} — {alert.city}</p>
-                      <p className="text-xs text-muted-foreground">{alert.value} (threshold: {alert.threshold})</p>
+                      <p className="text-sm font-medium">{event.city} · {event.triggerValue}</p>
+                      <p className="text-xs text-muted-foreground">{new Date(event.startsAt).toLocaleString("en-IN")}</p>
                     </div>
                   </div>
-                  <Badge variant={alert.severity === "extreme" ? "destructive" : "secondary"} className="text-[10px]">
-                    {alert.severity}
-                  </Badge>
+                  <Badge variant="outline">{event.severity}</Badge>
                 </div>
               );
             })}
@@ -237,23 +214,18 @@ export default function Dashboard() {
 
         <Card>
           <CardHeader className="pb-2">
-            <CardTitle className="text-sm font-medium flex items-center gap-2">
-              <FileText className="w-4 h-4" /> Recent Claims
-            </CardTitle>
+            <CardTitle className="text-sm font-medium">Recent Claims</CardTitle>
           </CardHeader>
-          <CardContent className="space-y-2 pt-0">
-            {recentClaims?.map((claim) => (
-              <div key={claim.id} className="flex items-center justify-between p-2.5 rounded-lg bg-accent/50 border border-border" data-testid={`claim-${claim.id}`}>
+          <CardContent className="space-y-2">
+            {recentClaims.map((claim) => (
+              <div key={claim.id} className="rounded-lg border border-border p-3 flex items-center justify-between">
                 <div>
-                  <p className="text-sm font-medium text-foreground">{triggerLabels[claim.triggerType]} — {claim.triggerValue}</p>
-                  <p className="text-xs text-muted-foreground">{claim.incomeLosstHours}h lost · ₹{claim.payoutAmount?.toLocaleString("en-IN")}</p>
+                  <p className="text-sm font-medium">{claim.triggerType.replace(/_/g, " ")}</p>
+                  <p className="text-xs text-muted-foreground">
+                    {(claim.impactLossRatio * 100).toFixed(0)}% loss · {claim.approvedCompensationHours.toFixed(1)}h compensated
+                  </p>
                 </div>
-                <Badge
-                  variant={claim.status === "paid" ? "default" : claim.status === "approved" ? "secondary" : claim.status === "rejected" ? "destructive" : "outline"}
-                  className="text-[10px]"
-                >
-                  {claim.status}
-                </Badge>
+                <Badge variant="outline">{claim.status.replace(/_/g, " ")}</Badge>
               </div>
             ))}
           </CardContent>

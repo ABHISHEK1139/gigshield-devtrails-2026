@@ -1,294 +1,681 @@
-import type { Express } from "express";
-import { createServer, type Server } from "http";
+import type { Express, Response } from "express";
+import { type Server } from "http";
+import { z } from "zod";
+import {
+  insertWorkerActivitySessionSchema,
+  insertWorkerSchema,
+  insertWorkerEarningsSnapshotSchema,
+  type Worker,
+  type WorkerActivitySession,
+} from "@shared/schema";
 import { storage } from "./storage";
-import { insertWorkerSchema, insertPolicySchema, insertClaimSchema, insertWeatherAlertSchema } from "@shared/schema";
+import {
+  checkWeatherTriggers,
+  detectTriggeredThresholds,
+  fetchAllCitiesWeather,
+  fetchWeatherByCoordinates,
+  findNearestMonitoredCity,
+} from "./weatherService";
+import {
+  createWorkerInvite,
+  loginHandler,
+  logoutHandler,
+  meHandler,
+  provisionWorkerIdentity,
+  requireAdmin,
+  requireWorker,
+  sessionHandler,
+  workerActivateHandler,
+  workerLoginHandler,
+  logAudit,
+  getAuditLog,
+} from "./auth";
+import { previewPolicyFromVerifiedBaseline, summarizeVerifiedEarnings } from "./hybridEngine";
+import {
+  recomputeClaimsFromTriggers,
+  recomputeClaimsForEvent,
+  SIMULATION_SCENARIO_KEYS,
+  seedSyntheticImpactForWorker,
+  upsertEventFromTrigger,
+  weatherToTrigger,
+} from "./disruptionWorkflow";
+import { getCronStatus } from "./weatherCron";
 
-// Simple AI risk scoring engine
-function calculateRiskScore(worker: { city: string; zone: string; vehicleType: string; avgDailyHours: number; experienceMonths: number; avgWeeklyEarnings: number }): number {
-  let score = 50; // base
+const PLAN_COVERAGE: Record<string, string[]> = {
+  basic: ["extreme_heat", "heavy_rain"],
+  standard: ["extreme_heat", "heavy_rain", "flood", "pollution"],
+  premium: ["extreme_heat", "heavy_rain", "flood", "pollution", "curfew", "strike"],
+};
 
-  // City risk factor (weather + pollution prone)
-  const highRiskCities: Record<string, number> = { Delhi: 15, Mumbai: 12, Chennai: 10, Kolkata: 8, Hyderabad: 6, Bangalore: 4, Pune: 3 };
-  score += highRiskCities[worker.city] || 0;
+let simulationRunSequence = 0;
 
-  // Vehicle type (bicycle riders more vulnerable)
-  if (worker.vehicleType === "bicycle") score += 15;
-  else if (worker.vehicleType === "bike") score += 5;
-  else if (worker.vehicleType === "ev") score += 2;
-
-  // Hours worked (more hours = more exposure)
-  if (worker.avgDailyHours > 10) score += 10;
-  else if (worker.avgDailyHours > 8) score += 5;
-
-  // Experience (less experience = higher risk)
-  if (worker.experienceMonths < 6) score += 12;
-  else if (worker.experienceMonths < 12) score += 6;
-  else if (worker.experienceMonths > 24) score -= 8;
-
-  return Math.max(0, Math.min(100, score));
+function shapeError(code: string, message: string, details?: unknown) {
+  return { code, message, details };
 }
 
-// Dynamic premium calculation
-function calculateWeeklyPremium(riskScore: number, planTier: string, avgWeeklyEarnings: number): number {
-  const basePremiumRates: Record<string, number> = { basic: 0.015, standard: 0.025, premium: 0.04 };
-  const rate = basePremiumRates[planTier] || 0.025;
-  const riskMultiplier = 0.7 + (riskScore / 100) * 0.6; // 0.7x to 1.3x
-  const premium = avgWeeklyEarnings * rate * riskMultiplier;
-  return Math.round(premium * 100) / 100;
+function getSchedulerMode() {
+  if (process.env.RUN_SCHEDULER === "true") {
+    return "dedicated-scheduler";
+  }
+
+  return process.env.NODE_ENV === "production"
+    ? "manual-or-external"
+    : "inline-development";
 }
 
-// Fraud detection scoring
-function calculateFraudScore(claim: { triggerType: string; incomeLosstHours: number; payoutAmount: number; triggeredAt: string }, workerClaims: { triggeredAt: string; triggerType: string }[]): { score: number; flags: string[] } {
-  let score = 0;
-  const flags: string[] = [];
+async function getWorkerOrRespond(res: Response, workerId: string): Promise<Worker | undefined> {
+  const worker = await storage.getWorker(workerId);
+  if (!worker) {
+    res.status(404).json(shapeError("WORKER_NOT_FOUND", "Worker not found."));
+    return undefined;
+  }
 
-  // Check claim frequency (more than 3 claims in a week is suspicious)
-  const oneWeekAgo = new Date(Date.now() - 7 * 86400000);
-  const recentClaims = workerClaims.filter(c => new Date(c.triggeredAt) > oneWeekAgo);
-  if (recentClaims.length >= 3) { score += 30; flags.push("high_frequency"); }
-  else if (recentClaims.length >= 2) { score += 15; flags.push("moderate_frequency"); }
-
-  // Duplicate time window check
-  const claimTime = new Date(claim.triggeredAt).getTime();
-  const duplicateWindow = workerClaims.some(c => {
-    const diff = Math.abs(new Date(c.triggeredAt).getTime() - claimTime);
-    return diff < 3600000 && diff > 0; // within 1 hour
-  });
-  if (duplicateWindow) { score += 25; flags.push("duplicate_window"); }
-
-  // Unusually high hours claimed
-  if (claim.incomeLosstHours > 10) { score += 15; flags.push("excessive_hours"); }
-
-  // High payout relative to income loss
-  if (claim.payoutAmount / claim.incomeLosstHours > 150) { score += 10; flags.push("high_hourly_rate"); }
-
-  return { score: Math.min(score, 100), flags };
+  return worker;
 }
 
-export async function registerRoutes(httpServer: Server, app: Express): Promise<Server> {
-  // === WORKERS ===
-  app.get("/api/workers", async (_req, res) => {
-    const workers = await storage.getAllWorkers();
-    res.json(workers);
+function summarizeActivitySessions(sessions: WorkerActivitySession[]) {
+  const totals = sessions.reduce(
+    (acc, session) => {
+      acc.onlineMinutes += session.onlineMinutes;
+      acc.activeMinutes += session.activeMinutes;
+      acc.ordersCompleted += session.ordersCompleted ?? 0;
+      acc.distanceKm += session.distanceKm ?? 0;
+      return acc;
+    },
+    { onlineMinutes: 0, activeMinutes: 0, ordersCompleted: 0, distanceKm: 0 },
+  );
+
+  return {
+    totals,
+    sessionCount: sessions.length,
+    latestSessionAt: sessions.length ? sessions[sessions.length - 1].endedAt : null,
+  };
+}
+
+function nextSimulationTime() {
+  simulationRunSequence += 1;
+  return new Date(Date.now() + simulationRunSequence * 8 * 60 * 60 * 1000);
+}
+
+function severityRank(severity: string) {
+  if (severity === "extreme") return 3;
+  if (severity === "severe") return 2;
+  return 1;
+}
+
+export async function registerRoutes(_httpServer: Server, app: Express): Promise<Server> {
+  app.get("/health/live", async (_req, res) => {
+    res.json({ ok: true, service: "gigshield-web", now: new Date().toISOString() });
   });
 
-  app.get("/api/workers/:id", async (req, res) => {
-    const worker = await storage.getWorker(req.params.id);
-    if (!worker) return res.status(404).json({ error: "Worker not found" });
-    res.json(worker);
+  app.get("/health/ready", async (_req, res) => {
+    const workerCount = (await storage.getAllWorkers()).length;
+    res.json({
+      ok: true,
+      service: "gigshield-web",
+      workerCount,
+      schedulerMode: getSchedulerMode(),
+    });
   });
 
-  app.post("/api/workers", async (req, res) => {
-    const parsed = insertWorkerSchema.safeParse(req.body);
-    if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
+  app.post("/api/auth/login", loginHandler);
+  app.post("/api/auth/worker/login", workerLoginHandler);
+  app.post("/api/auth/worker/activate", workerActivateHandler);
+  app.post("/api/auth/logout", logoutHandler);
+  app.get("/api/auth/session", sessionHandler);
+  app.get("/api/auth/me", meHandler);
 
-    const existing = await storage.getWorkerByPhone(parsed.data.phone);
-    if (existing) return res.status(409).json({ error: "Phone number already registered" });
+  app.get("/api/admin/audit-log", requireAdmin, async (_req, res) => {
+    res.json(getAuditLog());
+  });
+
+  app.get("/api/admin/workers", requireAdmin, async (_req, res) => {
+    res.json(await storage.getAllWorkers());
+  });
+
+  app.post("/api/admin/workers", requireAdmin, async (req, res) => {
+    const schema = insertWorkerSchema.extend({
+      payoutAccountRef: z.string().min(3).optional(),
+    });
+    const parsed = schema.safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json(shapeError("INVALID_WORKER", "Worker payload is invalid.", parsed.error.flatten()));
+    }
 
     const worker = await storage.createWorker(parsed.data);
-    const riskScore = calculateRiskScore(worker);
-    await storage.updateWorkerRiskScore(worker.id, riskScore);
-    worker.riskScore = riskScore;
+    provisionWorkerIdentity({
+      workerId: worker.id,
+      phone: worker.phone,
+      displayName: worker.name,
+    });
+    await storage.upsertWorkerPayoutMethod(worker.id, {
+      workerId: worker.id,
+      method: "upi",
+      label: "Primary UPI",
+      accountRef: parsed.data.payoutAccountRef || `upi@${worker.phone.slice(-4)}`,
+      verificationStatus: "verified",
+      lastUpdatedAt: new Date().toISOString(),
+      riskLockedUntil: null,
+    });
+    logAudit(req, "CREATE_WORKER", worker.id, "success", worker.name);
     res.status(201).json(worker);
   });
 
-  // === POLICIES ===
-  app.get("/api/policies", async (_req, res) => {
-    const policies = await storage.getAllPolicies();
-    res.json(policies);
+  app.post("/api/admin/workers/:id/invite", requireAdmin, async (req, res) => {
+    const worker = await getWorkerOrRespond(res, String(req.params.id));
+    if (!worker) {
+      return;
+    }
+
+    provisionWorkerIdentity({
+      workerId: worker.id,
+      phone: worker.phone,
+      displayName: worker.name,
+    });
+    const invite = createWorkerInvite(worker.id);
+    const activationUrl = `${req.protocol}://${req.get("host")}/activate?token=${invite.token}`;
+    logAudit(req, "CREATE_WORKER_INVITE", worker.id, "success");
+    res.status(201).json({
+      ...invite,
+      activationUrl,
+    });
   });
 
-  app.get("/api/policies/worker/:workerId", async (req, res) => {
-    const policies = await storage.getPoliciesByWorker(req.params.workerId);
-    res.json(policies);
+  app.get("/api/admin/workers/:id/earnings-summary", requireAdmin, async (req, res) => {
+    const worker = await getWorkerOrRespond(res, String(req.params.id));
+    if (!worker) {
+      return;
+    }
+
+    const snapshots = await storage.getWorkerEarningsSnapshots(worker.id);
+    const summary = summarizeVerifiedEarnings(worker, snapshots);
+    const payoutMethod = await storage.getWorkerPayoutMethod(worker.id);
+    res.json({ worker, summary, payoutMethod, snapshots });
   });
 
-  app.post("/api/policies", async (req, res) => {
-    const worker = await storage.getWorker(req.body.workerId);
-    if (!worker) return res.status(404).json({ error: "Worker not found" });
+  app.get("/api/admin/workers/:id/activity-summary", requireAdmin, async (req, res) => {
+    const worker = await getWorkerOrRespond(res, String(req.params.id));
+    if (!worker) {
+      return;
+    }
 
-    const riskScore = worker.riskScore || calculateRiskScore(worker);
-    const weeklyPremium = calculateWeeklyPremium(riskScore, req.body.planTier, worker.avgWeeklyEarnings);
+    const sessions = await storage.getWorkerActivitySessions(worker.id);
+    const summary = summarizeActivitySessions(sessions);
 
-    const maxCoverage: Record<string, number> = { basic: 1500, standard: 3000, premium: 5000 };
-    const policyData = {
-      ...req.body,
-      weeklyPremium,
-      maxWeeklyCoverage: maxCoverage[req.body.planTier] || 3000,
-      startDate: new Date().toISOString().split("T")[0],
-    };
+    res.json({
+      worker,
+      ...summary,
+      sessions,
+    });
+  });
 
-    const parsed = insertPolicySchema.safeParse(policyData);
-    if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
+  app.post("/api/admin/workers/:id/earnings-import", requireAdmin, async (req, res) => {
+    const worker = await getWorkerOrRespond(res, String(req.params.id));
+    if (!worker) {
+      return;
+    }
 
-    const policy = await storage.createPolicy(parsed.data);
+    const snapshotSchema = insertWorkerEarningsSnapshotSchema
+      .omit({ workerId: true })
+      .extend({
+        completedOrders: z.number().int().nonnegative().optional(),
+        notes: z.string().optional(),
+      });
+    const payloadSchema = z.object({
+      snapshots: z.array(snapshotSchema).min(1),
+    });
+    const parsed = payloadSchema.safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json(shapeError("INVALID_EARNINGS_IMPORT", "Invalid earnings import payload.", parsed.error.flatten()));
+    }
+
+    const imported = await storage.importWorkerEarningsSnapshots(
+      worker.id,
+      parsed.data.snapshots.map((snapshot) => ({ ...snapshot, workerId: worker.id })),
+    );
+    logAudit(req, "IMPORT_EARNINGS", worker.id, "success", `${imported.length} snapshots`);
+    res.status(201).json({
+      imported,
+      summary: summarizeVerifiedEarnings(worker, await storage.getWorkerEarningsSnapshots(worker.id)),
+    });
+  });
+
+  app.post("/api/admin/workers/:id/activity-import", requireAdmin, async (req, res) => {
+    const worker = await getWorkerOrRespond(res, String(req.params.id));
+    if (!worker) {
+      return;
+    }
+
+    const sessionSchema = insertWorkerActivitySessionSchema
+      .omit({ workerId: true })
+      .extend({
+        notes: z.string().optional(),
+      });
+    const payloadSchema = z.object({
+      sessions: z.array(sessionSchema).min(1),
+    });
+    const parsed = payloadSchema.safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json(shapeError("INVALID_ACTIVITY_IMPORT", "Invalid activity import payload.", parsed.error.flatten()));
+    }
+
+    const imported = await storage.importWorkerActivitySessions(
+      worker.id,
+      parsed.data.sessions.map((session) => ({ ...session, workerId: worker.id })),
+    );
+    const summary = summarizeActivitySessions(imported);
+    logAudit(req, "IMPORT_ACTIVITY", worker.id, "success", `${imported.length} sessions`);
+    res.status(201).json({
+      imported,
+      summary,
+    });
+  });
+
+  app.post("/api/admin/policies/preview", requireAdmin, async (req, res) => {
+    const schema = z.object({
+      workerId: z.string().min(1),
+      planTier: z.enum(["basic", "standard", "premium"]),
+    });
+    const parsed = schema.safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json(shapeError("INVALID_POLICY_PREVIEW", "Invalid policy preview payload.", parsed.error.flatten()));
+    }
+
+    const worker = await getWorkerOrRespond(res, parsed.data.workerId);
+    if (!worker) {
+      return;
+    }
+
+    const preview = previewPolicyFromVerifiedBaseline(
+      worker,
+      parsed.data.planTier,
+      await storage.getWorkerEarningsSnapshots(worker.id),
+    );
+    res.json(preview);
+  });
+
+  app.get("/api/admin/policies", requireAdmin, async (_req, res) => {
+    res.json(await storage.getAllPolicies());
+  });
+
+  app.post("/api/admin/policies", requireAdmin, async (req, res) => {
+    const schema = z.object({
+      workerId: z.string().min(1),
+      planTier: z.enum(["basic", "standard", "premium"]),
+      autoRenew: z.boolean().optional(),
+    });
+    const parsed = schema.safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json(shapeError("INVALID_POLICY", "Invalid policy create payload.", parsed.error.flatten()));
+    }
+
+    const worker = await getWorkerOrRespond(res, parsed.data.workerId);
+    if (!worker) {
+      return;
+    }
+
+    const existing = await storage.getPoliciesByWorker(worker.id);
+    if (existing.some((policy) => policy.status === "active" && policy.planTier === parsed.data.planTier)) {
+      return res.status(409).json(shapeError("DUPLICATE_POLICY", "Worker already has an active policy of this tier."));
+    }
+
+    const preview = previewPolicyFromVerifiedBaseline(
+      worker,
+      parsed.data.planTier,
+      await storage.getWorkerEarningsSnapshots(worker.id),
+    );
+    if (preview.status === "blocked") {
+      return res.status(422).json(shapeError("UNDERWRITING_BLOCKED", "Worker is not eligible for automated policy issuance.", preview.reasons));
+    }
+
+    const policy = await storage.createPolicy({
+      workerId: worker.id,
+      planTier: parsed.data.planTier,
+      weeklyPremium: preview.weeklyPremium,
+      maxWeeklyCoverage: preview.maxWeeklyCoverage,
+      coverageTypes: PLAN_COVERAGE[parsed.data.planTier],
+      underwritingStatus: preview.status,
+      underwritingNotes: preview.reasons.join(" ") || null,
+      baselineWeeklyEarnings: preview.baselineWeeklyEarnings,
+      baselineHourlyEarnings: preview.baselineHourlyEarnings,
+      baselineActiveHours: preview.baselineActiveHours,
+      pricingVersion: preview.pricingVersion,
+      riskInputsSnapshot: preview.riskInputsSnapshot,
+      startDate: new Date().toISOString(),
+      waitingPeriodEndsAt: preview.waitingPeriodEndsAt,
+      endDate: null,
+      autoRenew: parsed.data.autoRenew ?? true,
+    });
+
+    logAudit(req, "CREATE_POLICY", policy.id, "success", `${worker.name} - ${policy.planTier}`);
     res.status(201).json(policy);
   });
 
-  // === CLAIMS ===
-  app.get("/api/claims", async (_req, res) => {
+  app.get("/api/admin/events", requireAdmin, async (_req, res) => {
+    res.json(await storage.getAllEvents());
+  });
+
+  app.post("/api/admin/events/recompute", requireAdmin, async (req, res) => {
+    try {
+      const { weather, triggers } = await checkWeatherTriggers();
+      const results = await recomputeClaimsFromTriggers(
+        triggers.map((trigger) => ({
+          city: trigger.city,
+          zone: trigger.zone,
+          type: trigger.type,
+          severity: trigger.severity,
+          value: trigger.value,
+          threshold: trigger.threshold,
+          verificationPayload: JSON.stringify({ liveWeather: weather.find((item) => item.city === trigger.city) || null }),
+        })),
+      );
+
+      const claimsCreated = results.reduce((sum, result) => sum + result.claims.length, 0);
+      logAudit(req, "RECOMPUTE_EVENTS", "live_weather", "success", `${triggers.length} triggers / ${claimsCreated} claims`);
+      res.json({
+        status: "connected",
+        weather,
+        triggersFound: triggers.length,
+        eventsCreated: results.length,
+        claimsCreated,
+        results,
+      });
+    } catch (error) {
+      res.status(503).json(shapeError("WEATHER_UNAVAILABLE", "Unable to recompute disruption events from live weather.", String(error)));
+    }
+  });
+
+  app.get("/api/admin/claims", requireAdmin, async (_req, res) => {
     const claims = await storage.getAllClaims();
-    res.json(claims);
-  });
-
-  app.get("/api/claims/worker/:workerId", async (req, res) => {
-    const claims = await storage.getClaimsByWorker(req.params.workerId);
-    res.json(claims);
-  });
-
-  app.post("/api/claims", async (req, res) => {
-    const parsed = insertClaimSchema.safeParse(req.body);
-    if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
-
-    const claim = await storage.createClaim(parsed.data);
-
-    // Run fraud detection
-    const workerClaims = await storage.getClaimsByWorker(claim.workerId);
-    const { score, flags } = calculateFraudScore(
-      { triggerType: claim.triggerType, incomeLosstHours: claim.incomeLosstHours, payoutAmount: claim.payoutAmount, triggeredAt: claim.triggeredAt },
-      workerClaims.filter(c => c.id !== claim.id)
+    const signalsByClaim = Object.fromEntries(
+      await Promise.all(
+        claims.map(async (claim) => [claim.id, await storage.getFraudSignalsByClaim(claim.id)]),
+      ),
     );
+    res.json(claims.map((claim) => ({ ...claim, signals: signalsByClaim[claim.id] || [] })));
+  });
 
-    // Auto-approve if fraud score < 30
-    if (score < 30) {
-      await storage.updateClaimStatus(claim.id, "approved", score, flags.length > 0 ? flags : undefined);
-      claim.status = "approved";
-      claim.autoApproved = true;
-    } else {
-      await storage.updateClaimStatus(claim.id, "pending", score, flags);
+  app.post("/api/admin/claims/:id/review", requireAdmin, async (req, res) => {
+    const schema = z.object({
+      action: z.enum(["approve", "reject", "manual_review"]),
+      notes: z.string().optional(),
+    });
+    const parsed = schema.safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json(shapeError("INVALID_REVIEW", "Invalid review payload.", parsed.error.flatten()));
     }
 
-    claim.fraudScore = score;
-    claim.fraudFlags = flags.length > 0 ? flags : null;
-    res.status(201).json(claim);
-  });
-
-  app.patch("/api/claims/:id/status", async (req, res) => {
-    const { status } = req.body;
-    if (!["approved", "rejected", "paid"].includes(status)) {
-      return res.status(400).json({ error: "Invalid status" });
+    const claim = await storage.getClaim(String(req.params.id));
+    if (!claim) {
+      return res.status(404).json(shapeError("CLAIM_NOT_FOUND", "Claim not found."));
     }
-    const claim = await storage.updateClaimStatus(req.params.id, status);
-    if (!claim) return res.status(404).json({ error: "Claim not found" });
-    res.json(claim);
+    if (claim.blockReason && parsed.data.action === "approve") {
+      return res.status(422).json(shapeError("HARD_BLOCK", "Blocked claims cannot be manually approved until the block condition is resolved."));
+    }
+
+    const nextStatus =
+      parsed.data.action === "approve"
+        ? "approved"
+        : parsed.data.action === "reject"
+          ? "rejected"
+          : "manual_review";
+    const updated = await storage.updateClaim(claim.id, {
+      status: nextStatus,
+      processedAt: new Date().toISOString(),
+      decisionExplanation: parsed.data.notes || claim.decisionExplanation,
+      autoApproved: false,
+    });
+
+    await storage.createFraudReview({
+      claimId: claim.id,
+      reviewer: "admin",
+      decision: nextStatus,
+      notes: parsed.data.notes,
+    });
+
+    logAudit(req, "REVIEW_CLAIM", claim.id, "success", nextStatus);
+    res.json(updated);
   });
 
-  // === WEATHER ALERTS ===
-  app.get("/api/alerts", async (_req, res) => {
-    const alerts = await storage.getActiveAlerts();
-    res.json(alerts);
-  });
+  app.post("/api/admin/payouts", requireAdmin, async (req, res) => {
+    const schema = z.object({
+      claimId: z.string().min(1),
+    });
+    const parsed = schema.safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json(shapeError("INVALID_PAYOUT", "Invalid payout payload.", parsed.error.flatten()));
+    }
 
-  app.post("/api/alerts", async (req, res) => {
-    const parsed = insertWeatherAlertSchema.safeParse(req.body);
-    if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
-    const alert = await storage.createAlert(parsed.data);
-    res.status(201).json(alert);
-  });
+    const claim = await storage.getClaim(parsed.data.claimId);
+    if (!claim) {
+      return res.status(404).json(shapeError("CLAIM_NOT_FOUND", "Claim not found."));
+    }
+    if (claim.status !== "approved") {
+      return res.status(400).json(shapeError("CLAIM_NOT_APPROVED", "Only approved claims can be paid."));
+    }
 
-  app.patch("/api/alerts/:id/resolve", async (req, res) => {
-    const alert = await storage.resolveAlert(req.params.id);
-    if (!alert) return res.status(404).json({ error: "Alert not found" });
-    res.json(alert);
-  });
+    const payoutMethod = await storage.getWorkerPayoutMethod(claim.workerId);
+    if (!payoutMethod) {
+      return res.status(422).json(shapeError("NO_PAYOUT_METHOD", "Worker does not have a payout method on file."));
+    }
+    if (payoutMethod.riskLockedUntil && new Date(payoutMethod.riskLockedUntil).getTime() > Date.now()) {
+      return res.status(422).json(shapeError("PAYOUT_RISK_LOCK", "Payout method is inside the post-update review window."));
+    }
 
-  // === PAYOUTS ===
-  app.get("/api/payouts", async (_req, res) => {
-    const payouts = await storage.getAllPayouts();
-    res.json(payouts);
-  });
-
-  app.post("/api/payouts", async (req, res) => {
-    const claim = await storage.getClaim(req.body.claimId);
-    if (!claim) return res.status(404).json({ error: "Claim not found" });
-    if (claim.status !== "approved") return res.status(400).json({ error: "Claim not approved" });
+    const existingPayout = (await storage.getPayoutsByClaim(claim.id))[0];
+    if (existingPayout) {
+      return res.json(existingPayout);
+    }
 
     const payout = await storage.createPayout({
       claimId: claim.id,
       workerId: claim.workerId,
+      payoutMethodId: payoutMethod.id,
       amount: claim.payoutAmount,
-      method: req.body.method || "upi",
+      method: payoutMethod.method,
+      idempotencyKey: `claim-${claim.id}`,
     });
-
-    // Simulate instant payout processing
-    const txId = `TXN${Date.now().toString(36).toUpperCase()}${Math.random().toString(36).slice(2, 6).toUpperCase()}`;
+    const txId = `TXN${Date.now().toString(36).toUpperCase()}${Math.random()
+      .toString(36)
+      .slice(2, 6)
+      .toUpperCase()}`;
     await storage.updatePayoutStatus(payout.id, "completed", txId);
-    await storage.updateClaimStatus(claim.id, "paid");
-    payout.status = "completed";
-    payout.transactionId = txId;
-    res.status(201).json(payout);
+    await storage.updateClaim(claim.id, { status: "paid", processedAt: new Date().toISOString() });
+    logAudit(req, "PAY_CLAIM", claim.id, "success", `Rs ${claim.payoutAmount}`);
+    res.status(201).json(await storage.getPayoutsByClaim(claim.id).then((items) => items[0]));
   });
 
-  // === DASHBOARD ===
-  app.get("/api/dashboard", async (_req, res) => {
-    const stats = await storage.getDashboardStats();
-    res.json(stats);
+  app.get("/api/worker/me", requireWorker, async (req, res) => {
+    const worker = await getWorkerOrRespond(res, req.worker!.workerId!);
+    if (!worker) {
+      return;
+    }
+    res.json(worker);
   });
 
-  // === PREMIUM CALCULATOR ===
-  app.post("/api/calculate-premium", async (req, res) => {
-    const { city, zone, vehicleType, avgDailyHours, experienceMonths, avgWeeklyEarnings, planTier } = req.body;
-    const riskScore = calculateRiskScore({ city, zone, vehicleType, avgDailyHours, experienceMonths, avgWeeklyEarnings });
-    const premium = calculateWeeklyPremium(riskScore, planTier, avgWeeklyEarnings);
-    const maxCoverage: Record<string, number> = { basic: 1500, standard: 3000, premium: 5000 };
-    res.json({ riskScore, weeklyPremium: premium, maxWeeklyCoverage: maxCoverage[planTier] || 3000 });
+  app.get("/api/worker/policies", requireWorker, async (req, res) => {
+    res.json(await storage.getPoliciesByWorker(req.worker!.workerId!));
   });
 
-  // === SIMULATE TRIGGER ===
-  app.post("/api/simulate-trigger", async (req, res) => {
-    const { city, zone, alertType, severity, value, threshold } = req.body;
+  app.get("/api/worker/claims", requireWorker, async (req, res) => {
+    res.json(await storage.getClaimsByWorker(req.worker!.workerId!));
+  });
 
-    // Create weather alert
-    const alert = await storage.createAlert({
-      city, zone, alertType, severity, value, threshold,
-      triggeredAt: new Date().toISOString(),
-    });
+  app.get("/api/worker/payouts", requireWorker, async (req, res) => {
+    res.json(await storage.getPayoutsByWorker(req.worker!.workerId!));
+  });
 
-    // Find affected workers and auto-create claims
-    const allWorkers = await storage.getAllWorkers();
-    const affected = allWorkers.filter(w => w.city === city);
-    const autoClaims = [];
-
-    for (const worker of affected) {
-      const policies = await storage.getPoliciesByWorker(worker.id);
-      const activePolicy = policies.find(p => p.status === "active" && p.coverageTypes.includes(alertType));
-      if (!activePolicy) continue;
-
-      const hoursLost = severity === "extreme" ? 10 : severity === "severe" ? 6 : 3;
-      const hourlyRate = worker.avgWeeklyEarnings / (worker.avgDailyHours * 6);
-      const payoutAmount = Math.min(hoursLost * hourlyRate, activePolicy.maxWeeklyCoverage);
-
-      const claim = await storage.createClaim({
-        policyId: activePolicy.id,
-        workerId: worker.id,
-        triggerType: alertType,
-        triggerValue: value,
-        incomeLosstHours: hoursLost,
-        payoutAmount: Math.round(payoutAmount * 100) / 100,
-        triggeredAt: new Date().toISOString(),
-      });
-
-      // Auto-approve parametric claims with low fraud risk
-      const workerClaims = await storage.getClaimsByWorker(worker.id);
-      const { score, flags } = calculateFraudScore(
-        { triggerType: alertType, incomeLosstHours: hoursLost, payoutAmount, triggeredAt: claim.triggeredAt },
-        workerClaims.filter(c => c.id !== claim.id)
-      );
-
-      if (score < 30) {
-        await storage.updateClaimStatus(claim.id, "approved", score, flags.length > 0 ? flags : undefined);
-        claim.status = "approved";
-        claim.autoApproved = true;
-      } else {
-        await storage.updateClaimStatus(claim.id, "pending", score, flags);
-      }
-
-      claim.fraudScore = score;
-      autoClaims.push(claim);
+  app.get("/api/worker/alerts", requireWorker, async (req, res) => {
+    const worker = await getWorkerOrRespond(res, req.worker!.workerId!);
+    if (!worker) {
+      return;
     }
 
-    res.status(201).json({ alert, affectedWorkers: affected.length, claimsCreated: autoClaims.length, claims: autoClaims });
+    const alerts = await storage.getActiveAlerts();
+    res.json(
+      alerts.filter(
+        (alert) =>
+          alert.city === worker.city &&
+          (!alert.zone || alert.zone.toLowerCase() === worker.zone.toLowerCase()),
+      ),
+    );
   });
 
-  return httpServer;
+  app.get("/api/dashboard", requireAdmin, async (_req, res) => {
+    res.json(await storage.getDashboardStats());
+  });
+
+  app.get("/api/alerts", requireAdmin, async (_req, res) => {
+    res.json(await storage.getActiveAlerts());
+  });
+
+  app.get("/api/weather/live", requireAdmin, async (_req, res) => {
+    try {
+      const weather = await fetchAllCitiesWeather();
+      res.json({ status: "connected", fetchedAt: new Date().toISOString(), cities: weather });
+    } catch (error) {
+      res.status(503).json(shapeError("WEATHER_UNAVAILABLE", "Weather service unavailable.", String(error)));
+    }
+  });
+
+  app.get("/api/weather/location", requireAdmin, async (req, res) => {
+    const schema = z.object({
+      lat: z.coerce.number().min(-90).max(90),
+      lon: z.coerce.number().min(-180).max(180),
+    });
+    const parsed = schema.safeParse(req.query);
+    if (!parsed.success) {
+      return res
+        .status(400)
+        .json(shapeError("INVALID_LOCATION", "Latitude or longitude is invalid.", parsed.error.flatten()));
+    }
+
+    try {
+      const nearestCity = findNearestMonitoredCity(parsed.data.lat, parsed.data.lon);
+      const weather = await fetchWeatherByCoordinates(
+        parsed.data.lat,
+        parsed.data.lon,
+        nearestCity?.city ?? "Current Location",
+      );
+      const suggestedTriggers = detectTriggeredThresholds(weather)
+        .map((trigger) => ({
+          ...trigger,
+          city: nearestCity?.city ?? weather.city,
+          zone: nearestCity?.zone ?? "Current Zone",
+        }))
+        .sort((left, right) => severityRank(right.severity) - severityRank(left.severity));
+
+      res.json({
+        requestedLocation: parsed.data,
+        nearestCity,
+        weather,
+        suggestedTriggers,
+      });
+    } catch (error) {
+      res
+        .status(503)
+        .json(shapeError("WEATHER_UNAVAILABLE", "Unable to fetch live weather for this GPS location.", String(error)));
+    }
+  });
+
+  app.post("/api/simulate-trigger", requireAdmin, async (req, res) => {
+    if (process.env.NODE_ENV === "production") {
+      return res.status(403).json(shapeError("SIMULATION_DISABLED", "Simulation is disabled in production."));
+    }
+
+    const schema = z.object({
+      city: z.string().min(1),
+      zone: z.string().min(1),
+      alertType: z.string().min(1),
+      severity: z.enum(["warning", "severe", "extreme"]),
+      value: z.string().min(1),
+      threshold: z.string().min(1),
+      workerId: z.string().min(1).optional(),
+      scenarioKey: z.enum(SIMULATION_SCENARIO_KEYS).optional(),
+    });
+    const parsed = schema.safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json(shapeError("INVALID_SIMULATION", "Invalid simulation payload.", parsed.error.flatten()));
+    }
+
+    const simulationTime = nextSimulationTime();
+    const selectedWorker = parsed.data.workerId
+      ? await getWorkerOrRespond(res, parsed.data.workerId)
+      : undefined;
+    if (parsed.data.workerId && !selectedWorker) {
+      return;
+    }
+
+    const workers = selectedWorker
+      ? [selectedWorker]
+      : (await storage.getAllWorkers()).filter((worker) => worker.city === parsed.data.city);
+
+    await Promise.all(
+      workers.map((worker) =>
+        seedSyntheticImpactForWorker(
+          worker.id,
+          parsed.data.severity,
+          simulationTime,
+          parsed.data.scenarioKey ?? "legit_auto_approve",
+        ),
+      ),
+    );
+
+    const event = await upsertEventFromTrigger({
+      city: selectedWorker?.city ?? parsed.data.city,
+      zone: selectedWorker?.zone ?? parsed.data.zone,
+      type: parsed.data.alertType,
+      severity: parsed.data.severity,
+      value: parsed.data.value,
+      threshold: parsed.data.threshold,
+      source: "simulation",
+      verificationPayload: JSON.stringify({
+        synthetic: true,
+        scenarioKey: parsed.data.scenarioKey ?? "legit_auto_approve",
+        workerId: selectedWorker?.id ?? null,
+      }),
+    }, simulationTime.toISOString());
+    const result = await recomputeClaimsForEvent(event, {
+      targetWorkerIds: workers.map((worker) => worker.id),
+      ignoreClaimHistory: Boolean(parsed.data.scenarioKey),
+    });
+    logAudit(
+      req,
+      "SIMULATE_EVENT",
+      event.id,
+      "success",
+      `${parsed.data.scenarioKey ?? "custom"} / ${result.claims.length} claims`,
+    );
+    res.status(201).json({
+      event,
+      scenarioKey: parsed.data.scenarioKey ?? null,
+      affectedWorkers: workers.length,
+      workers: workers.map((worker) => ({
+        id: worker.id,
+        name: worker.name,
+        city: worker.city,
+        zone: worker.zone,
+      })),
+      claimsCreated: result.claims.length,
+      claims: result.claims,
+    });
+  });
+
+  app.get("/api/cron/status", requireAdmin, async (_req, res) => {
+    res.json({
+      ...getCronStatus(),
+      mode: getSchedulerMode(),
+    });
+  });
+
+  app.get("/api/admin/events/from-live-weather", requireAdmin, async (_req, res) => {
+    try {
+      const weather = await fetchAllCitiesWeather();
+      res.json(weather.flatMap(weatherToTrigger));
+    } catch (error) {
+      res.status(503).json(shapeError("WEATHER_UNAVAILABLE", "Unable to derive trigger candidates.", String(error)));
+    }
+  });
+
+  return _httpServer;
 }
