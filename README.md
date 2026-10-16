@@ -197,11 +197,10 @@ Scenario lab URL after login:
 http://localhost:5000/simulate
 ```
 
-Default admin login:
+Default admin login (set `ADMIN_PASSWORD` in your environment; see `.env.example`):
 
 ```text
 username: admin
-password: gigshield2026
 ```
 
 ## Run Commands

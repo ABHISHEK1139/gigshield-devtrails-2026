@@ -72,6 +72,8 @@ const workersByPhone = new Map<string, string>();
 const sessions = new Map<string, SessionRecord>();
 const auditLog: AuditEntry[] = [];
 const requestCounts = new Map<string, { count: number; resetAt: number }>();
+const RATE_LIMIT_SWEEP_INTERVAL_MS = 60 * 1000;
+let lastRateLimitSweepAt = 0;
 
 function hashPassword(password: string, salt: string) {
   return scryptSync(password, salt, 64).toString("hex");
@@ -174,8 +176,14 @@ function destroySession(sessionId: string) {
 }
 
 function initDefaultAdmin() {
-  const adminPassword = process.env.ADMIN_PASSWORD || "gigshield2026";
-  const credentials = createPasswordRecord(adminPassword);
+  const adminPassword = process.env.ADMIN_PASSWORD;
+  if (!adminPassword) {
+    if (process.env.NODE_ENV === "production") {
+      throw new Error("ADMIN_PASSWORD environment variable must be set in production.");
+    }
+    log("ADMIN_PASSWORD is not set; using the insecure development default. Set ADMIN_PASSWORD to override it.", "auth");
+  }
+  const credentials = createPasswordRecord(adminPassword || "gigshield2026");
   const admin: AdminUser = {
     id: "admin-001",
     username: "admin",
@@ -286,6 +294,17 @@ export function rateLimiter(maxRequests = 30, windowMs = 60000) {
   return (req: Request, res: Response, next: NextFunction) => {
     const ip = req.ip || req.socket.remoteAddress || "unknown";
     const now = Date.now();
+
+    // Periodically evict entries for IPs that stopped visiting; otherwise the
+    // map grows without bound over long uptimes.
+    if (now - lastRateLimitSweepAt > RATE_LIMIT_SWEEP_INTERVAL_MS) {
+      lastRateLimitSweepAt = now;
+      for (const [key, value] of requestCounts) {
+        if (now > value.resetAt) {
+          requestCounts.delete(key);
+        }
+      }
+    }
 
     let entry = requestCounts.get(ip);
     if (!entry || now > entry.resetAt) {

@@ -7,8 +7,8 @@ import type {
   Worker,
 } from "@shared/schema";
 import { buildEventKey, evaluateClaimForEvent } from "./hybridEngine";
-import { storage } from "./storage";
-import { getMonitoredCities, type CityWeather } from "./weatherService";
+import { startOfWeek, storage } from "./storage";
+import { detectTriggeredThresholds, getMonitoredCities, type CityWeather } from "./weatherService";
 
 const SEVERITY_DURATION_HOURS: Record<string, number> = {
   warning: 1.5,
@@ -169,7 +169,7 @@ export async function upsertEventFromTrigger(
     startsAt: window.startsAt,
   });
 
-  const event = await storage.createOrUpdateEvent({
+  const { event, created } = await storage.createOrUpdateEvent({
     eventKey,
     city: trigger.city,
     zone: trigger.zone,
@@ -183,15 +183,19 @@ export async function upsertEventFromTrigger(
     endsAt: window.endsAt,
   });
 
-  await storage.createAlert({
-    city: trigger.city,
-    zone: trigger.zone,
-    alertType: trigger.type,
-    severity: trigger.severity,
-    value: trigger.value,
-    threshold: trigger.threshold,
-    triggeredAt: window.startsAt,
-  });
+  // Only raise an alert for a genuinely new event; the weather poll re-runs
+  // this every 5 minutes and would otherwise pile up duplicate active alerts.
+  if (created) {
+    await storage.createAlert({
+      city: trigger.city,
+      zone: trigger.zone,
+      alertType: trigger.type,
+      severity: trigger.severity,
+      value: trigger.value,
+      threshold: trigger.threshold,
+      triggeredAt: window.startsAt,
+    });
+  }
 
   return event;
 }
@@ -258,7 +262,7 @@ async function createClaimForWorkerEvent(
     status: evaluation.status,
     blockReason: evaluation.blockReason,
     fraudScore: evaluation.fraudScore,
-    fraudFlags: evaluation.fraudFlags.length > 0 ? evaluation.fraudFlags : undefined,
+    fraudFlags: evaluation.fraudFlags.length > 0 ? evaluation.fraudFlags : null,
     decisionExplanation: evaluation.explanation,
     autoApproved: evaluation.status === "approved",
     processedAt: new Date().toISOString(),
@@ -332,6 +336,7 @@ export async function recomputeClaimsFromTriggers(
   triggers: TriggerInput[],
   triggeredAt = new Date().toISOString(),
 ) {
+  await resolveExpiredAlerts(new Date(triggeredAt));
   const results = [];
   for (const trigger of triggers) {
     const event = await upsertEventFromTrigger(trigger, triggeredAt);
@@ -351,9 +356,7 @@ export async function seedSyntheticImpactForWorker(
 
   const profile = resolveScenarioProfile(scenarioKey, severity);
   const dropRatio = profile.dropRatio;
-  const weekStart = new Date(triggeredAt);
-  weekStart.setDate(weekStart.getDate() - weekStart.getDay() + 1);
-  weekStart.setHours(0, 0, 0, 0);
+  const weekStart = startOfWeek(new Date(triggeredAt));
   const weekEnd = addHours(weekStart, 24 * 6);
 
   await ensureSimulationPayoutState(worker, triggeredAt, profile.payoutLockHours);
@@ -392,43 +395,46 @@ export async function seedSyntheticImpactForWorker(
   return snapshots;
 }
 
-export function weatherToTrigger(weather: CityWeather) {
+export function weatherToTrigger(weather: CityWeather): TriggerInput[] {
   const zone =
     getMonitoredCities().find((city) => city.city.toLowerCase() === weather.city.toLowerCase())?.zone ??
     `Central ${weather.city}`;
-  const triggers: TriggerInput[] = [];
-  if (weather.temperature >= 42) {
-    triggers.push({
-      city: weather.city,
-      zone,
-      type: "extreme_heat",
-      severity: weather.temperature >= 45 ? "extreme" : weather.temperature >= 43 ? "severe" : "warning",
-      value: `${weather.temperature} C`,
-      threshold: "42 C",
-      verificationPayload: JSON.stringify({ temperature: weather.temperature }),
-    });
+  // Single source of truth for trigger thresholds: reuse the THRESHOLDS
+  // definitions behind detectTriggeredThresholds instead of a second copy.
+  return detectTriggeredThresholds(weather).map((trigger) => ({
+    city: weather.city,
+    zone,
+    type: trigger.type,
+    severity: trigger.severity,
+    value: trigger.value,
+    threshold: trigger.threshold,
+    verificationPayload: JSON.stringify({
+      temperature: weather.temperature,
+      rainfall: weather.rainfall,
+      aqi: weather.aqi,
+    }),
+  }));
+}
+
+/**
+ * Retire active alerts whose disruption event has ended. An alert stays valid
+ * while at least one event for the same city/zone/type is still ongoing.
+ */
+export async function resolveExpiredAlerts(now: Date = new Date()) {
+  const nowMs = now.getTime();
+  const alerts = await storage.getActiveAlerts();
+  const events = await storage.getAllEvents();
+
+  for (const alert of alerts) {
+    const stillOngoing = events.some(
+      (event) =>
+        event.city === alert.city &&
+        event.zone === alert.zone &&
+        event.triggerType === alert.alertType &&
+        new Date(event.endsAt).getTime() > nowMs,
+    );
+    if (!stillOngoing) {
+      await storage.resolveAlert(alert.id);
+    }
   }
-  if (weather.rainfall >= 40) {
-    triggers.push({
-      city: weather.city,
-      zone,
-      type: "heavy_rain",
-      severity: weather.rainfall >= 90 ? "extreme" : weather.rainfall >= 65 ? "severe" : "warning",
-      value: `${weather.rainfall}mm/hr`,
-      threshold: "65mm/hr",
-      verificationPayload: JSON.stringify({ rainfall: weather.rainfall }),
-    });
-  }
-  if (weather.aqi !== null && weather.aqi >= 150) {
-    triggers.push({
-      city: weather.city,
-      zone,
-      type: "pollution",
-      severity: weather.aqi >= 300 ? "extreme" : weather.aqi >= 200 ? "severe" : "warning",
-      value: `${weather.aqi} AQI`,
-      threshold: "150 AQI",
-      verificationPayload: JSON.stringify({ aqi: weather.aqi }),
-    });
-  }
-  return triggers;
 }

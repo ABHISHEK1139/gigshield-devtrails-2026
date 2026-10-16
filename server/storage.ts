@@ -79,7 +79,10 @@ export interface IStorage {
   getEvent(id: string): Promise<DisruptionEvent | undefined>;
   getEventByKey(eventKey: string): Promise<DisruptionEvent | undefined>;
   getAllEvents(): Promise<DisruptionEvent[]>;
-  createOrUpdateEvent(event: InsertDisruptionEvent & { eventKey?: string }): Promise<DisruptionEvent>;
+  createOrUpdateEvent(event: InsertDisruptionEvent & { eventKey?: string }): Promise<{
+    event: DisruptionEvent;
+    created: boolean;
+  }>;
 
   getClaim(id: string): Promise<Claim | undefined>;
   getClaimsByWorker(workerId: string): Promise<Claim[]>;
@@ -139,7 +142,7 @@ function roundCurrency(value: number) {
   return Math.round(value * 100) / 100;
 }
 
-function startOfWeek(date: Date) {
+export function startOfWeek(date: Date) {
   const result = new Date(date);
   const day = result.getDay();
   const diff = result.getDate() - day + (day === 0 ? -6 : 1);
@@ -850,7 +853,7 @@ export class MemStorage implements IStorage {
       existing.source = event.source ?? "weather";
       existing.verificationPayload = event.verificationPayload ?? "{}";
       existing.isActive = false;
-      return existing;
+      return { event: existing, created: false };
     }
 
     const id = randomUUID();
@@ -864,7 +867,7 @@ export class MemStorage implements IStorage {
       createdAt: new Date(),
     };
     this.events.set(id, created);
-    return created;
+    return { event: created, created: true };
   }
 
   async getClaim(id: string) {
@@ -998,6 +1001,17 @@ export class MemStorage implements IStorage {
   }
 
   async createPayout(payout: InsertPayout) {
+    // Idempotency: a payout for this key already exists (e.g. a concurrent
+    // request or a retried admin action), so return it instead of double-paying.
+    // The find-then-insert below has no awaits in between, so it is atomic on
+    // the Node event loop and closes the check-then-create race.
+    const existing = Array.from(this.payouts.values()).find(
+      (candidate) => candidate.idempotencyKey === payout.idempotencyKey,
+    );
+    if (existing) {
+      return existing;
+    }
+
     const id = randomUUID();
     const created: Payout = {
       ...payout,
@@ -1033,10 +1047,14 @@ export class MemStorage implements IStorage {
       claimsByStatus[claim.status] = (claimsByStatus[claim.status] || 0) + 1;
     });
 
-    const totalPremiumCollected = activePolicies.reduce(
-      (sum, policy) => sum + policy.weeklyPremium * 2,
-      0,
-    );
+    const MS_PER_WEEK = 7 * 24 * 60 * 60 * 1000;
+    const totalPremiumCollected = activePolicies.reduce((sum, policy) => {
+      const elapsedWeeks = Math.max(
+        1,
+        Math.ceil((Date.now() - new Date(policy.startDate).getTime()) / MS_PER_WEEK),
+      );
+      return sum + policy.weeklyPremium * elapsedWeeks;
+    }, 0);
     const totalClaimsPaid = payouts.reduce((sum, payout) => sum + payout.amount, 0);
     const avgFraudScore =
       claims.reduce((sum, claim) => sum + (claim.fraudScore || 0), 0) / Math.max(claims.length, 1);

@@ -1,5 +1,6 @@
 import type { Express, Response } from "express";
 import { type Server } from "http";
+import { randomUUID } from "crypto";
 import { z } from "zod";
 import {
   insertWorkerActivitySessionSchema,
@@ -15,6 +16,7 @@ import {
   fetchAllCitiesWeather,
   fetchWeatherByCoordinates,
   findNearestMonitoredCity,
+  getMonitoredCities,
 } from "./weatherService";
 import {
   createWorkerInvite,
@@ -88,7 +90,12 @@ function summarizeActivitySessions(sessions: WorkerActivitySession[]) {
   return {
     totals,
     sessionCount: sessions.length,
-    latestSessionAt: sessions.length ? sessions[sessions.length - 1].endedAt : null,
+    latestSessionAt: sessions.length
+      ? sessions.reduce(
+          (latest, session) => (session.endedAt > latest ? session.endedAt : latest),
+          sessions[0].endedAt,
+        )
+      : null,
   };
 }
 
@@ -142,7 +149,8 @@ export async function registerRoutes(_httpServer: Server, app: Express): Promise
       return res.status(400).json(shapeError("INVALID_WORKER", "Worker payload is invalid.", parsed.error.flatten()));
     }
 
-    const worker = await storage.createWorker(parsed.data);
+    const { payoutAccountRef, ...workerPayload } = parsed.data;
+    const worker = await storage.createWorker(workerPayload);
     provisionWorkerIdentity({
       workerId: worker.id,
       phone: worker.phone,
@@ -152,7 +160,7 @@ export async function registerRoutes(_httpServer: Server, app: Express): Promise
       workerId: worker.id,
       method: "upi",
       label: "Primary UPI",
-      accountRef: parsed.data.payoutAccountRef || `upi@${worker.phone.slice(-4)}`,
+      accountRef: payoutAccountRef || `upi@${worker.phone.slice(-4)}`,
       verificationStatus: "verified",
       lastUpdatedAt: new Date().toISOString(),
       riskLockedUntil: null,
@@ -428,7 +436,7 @@ export async function registerRoutes(_httpServer: Server, app: Express): Promise
 
     await storage.createFraudReview({
       claimId: claim.id,
-      reviewer: "admin",
+      reviewer: req.authActor?.displayName ?? "admin",
       decision: nextStatus,
       notes: parsed.data.notes,
     });
@@ -462,11 +470,31 @@ export async function registerRoutes(_httpServer: Server, app: Express): Promise
       return res.status(422).json(shapeError("PAYOUT_RISK_LOCK", "Payout method is inside the post-update review window."));
     }
 
-    const existingPayout = (await storage.getPayoutsByClaim(claim.id))[0];
-    if (existingPayout) {
-      return res.json(existingPayout);
+    const existingPayouts = await storage.getPayoutsByClaim(claim.id);
+    const completedPayout = existingPayouts.find((payout) => payout.status === "completed");
+    if (completedPayout) {
+      return res.json(completedPayout);
     }
 
+    // A payout stuck in "processing" would block retries forever: treat a
+    // stale one as failed so the claim can be paid again.
+    const STALE_PROCESSING_PAYOUT_MS = 30 * 60 * 1000;
+    const staleProcessing = existingPayouts.find((payout) => {
+      if (payout.status !== "processing") return false;
+      const createdAtMs = payout.createdAt ? payout.createdAt.getTime() : 0;
+      return Date.now() - createdAtMs > STALE_PROCESSING_PAYOUT_MS;
+    });
+    if (staleProcessing) {
+      await storage.updatePayoutStatus(staleProcessing.id, "failed");
+    } else {
+      const inFlight = existingPayouts.find((payout) => payout.status === "processing");
+      if (inFlight) {
+        return res.json(inFlight);
+      }
+    }
+
+    // createPayout is idempotent on the idempotency key: a concurrent request
+    // that won the race returns the same payout row instead of double-paying.
     const payout = await storage.createPayout({
       claimId: claim.id,
       workerId: claim.workerId,
@@ -475,14 +503,14 @@ export async function registerRoutes(_httpServer: Server, app: Express): Promise
       method: payoutMethod.method,
       idempotencyKey: `claim-${claim.id}`,
     });
-    const txId = `TXN${Date.now().toString(36).toUpperCase()}${Math.random()
-      .toString(36)
-      .slice(2, 6)
-      .toUpperCase()}`;
+    if (payout.status === "completed") {
+      return res.json(payout);
+    }
+    const txId = `TXN${randomUUID().replace(/-/g, "").slice(0, 16).toUpperCase()}`;
     await storage.updatePayoutStatus(payout.id, "completed", txId);
     await storage.updateClaim(claim.id, { status: "paid", processedAt: new Date().toISOString() });
     logAudit(req, "PAY_CLAIM", claim.id, "success", `Rs ${claim.payoutAmount}`);
-    res.status(201).json(await storage.getPayoutsByClaim(claim.id).then((items) => items[0]));
+    res.status(201).json(payout);
   });
 
   app.get("/api/worker/me", requireWorker, async (req, res) => {
@@ -512,11 +540,21 @@ export async function registerRoutes(_httpServer: Server, app: Express): Promise
     }
 
     const alerts = await storage.getActiveAlerts();
+    // Live-weather alerts are zoned with the monitored-city label (e.g.
+    // "Central Delhi") rather than a worker's real zone (e.g. "South Delhi").
+    // Treat those as city-level so they reach every worker in the city.
+    const cityLevelZones = new Set(
+      getMonitoredCities()
+        .filter((city) => city.city === worker.city)
+        .map((city) => city.zone.toLowerCase()),
+    );
     res.json(
       alerts.filter(
         (alert) =>
           alert.city === worker.city &&
-          (!alert.zone || alert.zone.toLowerCase() === worker.zone.toLowerCase()),
+          (!alert.zone ||
+            alert.zone.toLowerCase() === worker.zone.toLowerCase() ||
+            cityLevelZones.has(alert.zone.toLowerCase())),
       ),
     );
   });
